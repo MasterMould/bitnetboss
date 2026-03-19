@@ -1,143 +1,203 @@
 #!/bin/bash
 # =================================================================
-# 🛡️ BITNET b1.58 OMNI-GPU: INTEL ARC A770 + AMD + NVIDIA (2026)
+# 🛡️ BITNET OMNI-SHIELD: LIVE MONITOR + PLUGIN MARKET + METADATA
 # =================================================================
 set -e
 
-# --- 1. SYSTEM HARDENING & FULL REQUIREMENT INSTALLATION ---
-echo "🏗️  Installing All 2026 Requirements (Text/Voice/Vision/GPU)..."
+NC='\033[0m'; RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'
+LOG_DIR="./chat_logs"
+LOG_FILE="$LOG_DIR/system.log"
+M_PATH="./models/default.gguf"
+PLUGIN_DIR="./plugins"
+MARKET_DIR="./marketplace"
+BENCH_FILE="./.bitnet_benchmark"
+LLAMA_BIN="./build/bin/llama-bench"
 
-# Add Intel oneAPI Repository for Arc A770 Support
-if ! command -v icpx &> /dev/null; then
-    wget -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | sudo gpg --dearmor -o /usr/share/keyrings/oneapi-archive-keyring.gpg
-    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | sudo tee /etc/apt/sources.list.d/oneAPI.list
-fi
+mkdir -p "$LOG_DIR" "$PLUGIN_DIR" "$MARKET_DIR"
 
-sudo apt update && sudo apt install -y \
-    git cmake build-essential clang-18 llvm-18 curl pandoc ffmpeg \
-    poppler-utils libmagic1 portaudio19-dev libasound2-dev espeak-ng \
-    opencv-data libopencv-dev libnuma-dev \
-    intel-oneapi-compiler-dpcpp-cpp intel-oneapi-mkl intel-oneapi-level-zero
-
-export CC=clang-18
-export CXX=clang++-18
-
-# --- 2. ENVIRONMENT & DIRECTORY SETUP ---
-[[ ! -d "BitNet" ]] && git clone --recursive https://github.com/microsoft/BitNet.git
-cd BitNet
-mkdir -p chat_logs models personas
-
-[[ ! -d "venv" ]] && python3 -m venv venv
-source venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt huggingface_hub openai open-webui \
-    pypdf python-docx pandas openpyxl openai-whisper piper-tts \
-    pillow opencv-python transformers 
-
-# --- 3. HARDWARE AUTO-TUNER (Intel Arc A770 / AMD / NVIDIA) ---
-configure_hardware() {
-    echo -e "\n🔍 Detecting GPU Architecture..."
-    FLAGS="-DBITNET_OPTIMIZE=ON"
-    
-    # Check for Intel Arc (SYCL)
-    if lspci | grep -i "VGA" | grep -iq "Intel"; then
-        echo "🚀 Intel GPU Detected (Arc A770). Enabling SYCL/oneAPI..."
-        source /opt/intel/oneapi/setvars.sh || true
-        FLAGS="$FLAGS -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx"
-    # Check for AMD (ROCm/HIP)
-    elif lspci | grep -i "VGA" | grep -iq "AMD"; then
-        echo "🚀 AMD GPU Detected. Enabling ROCm/HIP (gfx803+)..."
-        FLAGS="$FLAGS -DGGML_HIPBLAS=ON -DAMDGPU_TARGETS=gfx803,gfx1030,gfx1100" 
-    # Check for NVIDIA (CUDA)
-    elif nvidia-smi &>/dev/null; then
-        echo "🚀 NVIDIA GPU Detected. Enabling CUDA..."
-        FLAGS="$FLAGS -DGGML_CUDA=ON"
+# ================================================================
+# 🔧 DEPENDENCY ENGINE
+# ================================================================
+require_tool() {
+    NAME="$1"; CHECK_CMD="$2"; FIX_FUNC="$3"
+    if eval "$CHECK_CMD" &>/dev/null; then
+        echo -e "${GREEN}✅ $NAME OK${NC}"; return 0
     fi
-
-    # CPU AVX-512 Fallback/Parallelism
-    [[ $(grep -o "avx512" /proc/cpuinfo) ]] && FLAGS="$FLAGS -DGGML_AVX512=ON"
-
-    mkdir -p build && cd build
-    cmake .. $FLAGS
-    make -j$(nproc)
-    cd ..
-}
-[[ ! -d "build" ]] && configure_hardware
-
-# --- 4. AUTO-LOGGING SYSTEM (Retained) ---
-log_session() {
-    local type=$1
-    local content=$2
-    local timestamp=$(date "+%Y-%m-%d_%H-%M-%S")
-    echo -e "--- SESSION: $timestamp ---\nTYPE: $type\n\n$content\n\n" >> "chat_logs/history.log"
+    echo -e "${YELLOW}⚠️ Missing: $NAME — fixing...${NC}"
+    declare -f "$FIX_FUNC" >/dev/null && $FIX_FUNC || { echo -e "${RED}❌ No fix for $NAME${NC}"; return 1; }
+    eval "$CHECK_CMD" &>/dev/null && echo -e "${GREEN}✅ $NAME fixed${NC}" || return 1
 }
 
-# --- 5. PERSONA LIBRARY (Retained) ---
-select_persona() {
-    echo -e "\n🎭 SELECT AN AI PERSONA:"
-    echo "1) Standard  2) Coder  3) Data Analyst  4) Teacher  5) Pirate  6) Custom"
-    read -p "Selection [1-6]: " P_C
-    case $P_C in
-        2) PERS="Expert Coder";; 3) PERS="Data Analyst";; 4) PERS="Socratic Teacher";;
-        5) PERS="Grumpy Pirate";; 6) read -p "Prompt: " PERS;; *) PERS="Assistant";;
-    esac
+fix_llama_bench() { rm -rf build; mkdir build && cd build; cmake .. && make -j$(nproc); cd ..; }
+fix_python() { sudo apt update && sudo apt install -y python3 python3-pip python3-venv; }
+fix_cmake() { sudo apt update && sudo apt install -y cmake; }
+fix_ffmpeg() { sudo apt install -y ffmpeg; }
+
+# ================================================================
+# 🧩 PLUGIN SYSTEM (METADATA + DEPS)
+# ================================================================
+parse_metadata() {
+    FILE="$1"
+    NAME=$(grep "#@name:" "$FILE" | cut -d: -f2- | xargs)
+    DESC=$(grep "#@desc:" "$FILE" | cut -d: -f2- | xargs)
+    DEPS=$(grep "#@deps:" "$FILE" | cut -d: -f2- | xargs)
 }
 
-# --- 6. THE COMMAND CENTER ---
+handle_deps() {
+    for dep in $DEPS; do
+        case $dep in
+            python) require_tool "python3" "command -v python3" fix_python ;;
+            cmake) require_tool "cmake" "command -v cmake" fix_cmake ;;
+            ffmpeg) require_tool "ffmpeg" "command -v ffmpeg" fix_ffmpeg ;;
+            llama) require_tool "llama-bench" "[[ -f $LLAMA_BIN ]]" fix_llama_bench ;;
+        esac
+    done
+}
+
+run_plugin() {
+    FILE="$1"; parse_metadata "$FILE"
+    echo -e "${CYAN}▶ Running: ${NAME:-$(basename "$FILE")}${NC}"
+    [[ -n "$DESC" ]] && echo -e "${YELLOW}$DESC${NC}"
+    handle_deps
+    source "$FILE"
+}
+
+list_plugins() { ls "$PLUGIN_DIR"/*.sh 2>/dev/null | sort; }
+
+# ================================================================
+# 🛒 PLUGIN MARKETPLACE (LOCAL)
+# ================================================================
+market_list() {
+    echo -e "${CYAN}📦 Available plugins:${NC}"
+    ls "$MARKET_DIR"/*.sh 2>/dev/null | xargs -n1 basename
+}
+
+market_install() {
+    NAME="$1"
+    SRC="$MARKET_DIR/$NAME.sh"
+    DST="$PLUGIN_DIR/$NAME.sh"
+    if [[ -f "$SRC" ]]; then
+        cp "$SRC" "$DST"
+        echo -e "${GREEN}✅ Installed $NAME${NC}"
+    else
+        echo -e "${RED}❌ Plugin not found in marketplace${NC}"
+    fi
+}
+
+market_remove() {
+    NAME="$1"
+    FILE="$PLUGIN_DIR/$NAME.sh"
+    [[ -f "$FILE" ]] && rm "$FILE" && echo -e "${GREEN}🗑️ Removed $NAME${NC}"
+}
+
+# ================================================================
+# ⚡ BENCHMARK
+# ================================================================
+run_benchmark() {
+    require_tool "llama-bench" "[[ -f $LLAMA_BIN ]]" fix_llama_bench || return
+    BEST="CPU"; SCORE=0
+    test_backend() {
+        NAME=$1; CMD=$2
+        OUT=$(eval "$CMD" 2>/dev/null || true)
+        TOK=$(echo "$OUT" | grep -i tok/s | awk '{print $(NF-1)}' | head -n1)
+        TOK=${TOK:-0}
+        if (( $(echo "$TOK > $SCORE" | bc -l) )); then SCORE=$TOK; BEST=$NAME; fi
+    }
+    test_backend "CPU" "$LLAMA_BIN -m $M_PATH -t $(nproc) -n 64"
+    command -v nvidia-smi &>/dev/null && test_backend "CUDA" "$LLAMA_BIN -m $M_PATH -ngl 999 -n 64"
+    echo "backend=$BEST" > "$BENCH_FILE"
+    echo "tokens_per_sec=$SCORE" >> "$BENCH_FILE"
+}
+
+load_benchmark() { [[ -f "$BENCH_FILE" ]] && source "$BENCH_FILE"; }
+
+# ================================================================
+# 📊 LIVE MONITOR
+# ================================================================
+get_cpu() { top -bn1 | grep "Cpu(s)" | awk '{print $2+$4 "%"}'; }
+get_ram() { free -h | awk '/Mem:/ {print $3 "/" $2}'; }
+get_gpu() { command -v nvidia-smi &>/dev/null && nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -n1 | awk '{print $1 "%"}' || echo "N/A"; }
+
+print_header() {
+    load_benchmark
+    CPU=$(get_cpu); RAM=$(get_ram); GPU=$(get_gpu)
+    echo -e "${GREEN}CPU: $CPU | RAM: $RAM | GPU: $GPU | Backend: ${backend:-?} | Speed: ${tokens_per_sec:-?}${NC}"
+}
+
+# ================================================================
+# 🧪 DEFAULT PLUGINS
+# ================================================================
+create_default_plugins() {
+cat << 'EOF' > "$PLUGIN_DIR/chat.sh"
+#@name: Chat
+#@desc: Terminal chat
+#@deps: python
+
+echo "💬 Chat running"
+EOF
+}
+[[ -z "$(ls -A $PLUGIN_DIR 2>/dev/null)" ]] && create_default_plugins
+
+# ================================================================
+# 🧭 MAIN LOOP
+# ================================================================
 while true; do
-    echo -e "\n================================================"
-    echo "       🌌 BITNET UNIVERSAL WORKSTATION (v2026.7)"
-    echo "================================================"
-    echo "1) 💬 CHAT: Terminal + Persona + Auto-Log"
-    echo "2) 📄 FILE-CHAT: Analyze Docs (PDF/XLSX/CSV)"
-    echo "3) 👁️  VISION: BitVLA Image Analysis"
-    echo "4) 🎙️ VOICE: Whisper + Piper Pipeline"
-    echo "5) 🎨 WEBUI: Start Open WebUI + RAG"
-    echo "6) 🛠️  DEV: Benchmarking / Conversion"
-    echo "7) 📥 DOWNLOAD: 1.58-bit Models"
-    echo "8) 🔄 UPDATE: Pull Source & Rebuild"
-    echo "9) 🚪 EXIT"
-    read -p "Selection [1-9]: " CHOICE
+    print_header
+    echo -e "\n${CYAN}=========== OMNI-SHIELD ===========${NC}"
 
-    case $CHOICE in
-        1|2|3|4)
-            MODELS=($(find models -maxdepth 2 -name "*.gguf" 2>/dev/null))
-            [[ ${#MODELS[@]} -eq 0 ]] && { echo "❌ No models found."; continue; }
-            echo -e "\n📂 Models:"; for i in "${!MODELS[@]}"; do echo "$((i+1))) ${MODELS[$i]}"; done
-            read -p "Choice: " M_NUM; M_PATH="${MODELS[$((M_NUM-1))]}"
-            read -p "🧵 Threads [$(nproc)]: " THRD; THRD=${THRD:-$(nproc)}
+    i=1; declare -A MAP
 
-            if [[ "$CHOICE" == "1" ]]; then
-                select_persona
-                ./build/bin/llama-cli -m "$M_PATH" -p "System: $PERS \nUser: " -t "$THRD" -cnv | tee -a .temp_chat
-                log_session "CHAT" "$(cat .temp_chat)" && rm .temp_chat
-            elif [[ "$CHOICE" == "2" ]]; then
-                read -p "📎 File Path: " F_P
-                TEXT=$(python3 -c "import pypdf, docx, pandas as pd; p='$F_P'
-try:
-    if p.endswith('.pdf'): print(' '.join([pg.extract_text() for pg in pypdf.PdfReader(p).pages]))
-    elif p.endswith('.docx'): print('\n'.join([pa.text for pa in docx.Document(p).paragraphs]))
-    elif p.endswith(('.csv','.xlsx')): print(pd.read_excel(p).to_string() if p.endswith('.xlsx') else pd.read_csv(p).to_string())
-    else: print(open(p,'r').read())
-except: print('Error')")
-                ./build/bin/llama-cli -m "$M_PATH" -p "Context: $TEXT \nUser: " -t "$THRD" -cnv | tee -a .temp_file
-                log_session "FILE ($F_P)" "$(cat .temp_file)" && rm .temp_file
-            elif [[ "$CHOICE" == "3" ]]; then
-                read -p "🖼️ Image: " IMG_P; python3 utils/vision_handler.py --image "$IMG_P" --model "$M_PATH"
-            elif [[ "$CHOICE" == "4" ]]; then
-                python3 utils/voice_pipeline.py --model "$M_PATH" --threads "$THRD"
-            fi
-            ;;
-        5) ./build/bin/llama-server -m "$M_PATH" --port 8080 -t "$THRD" &
-           PID=$! && export OPENAI_API_BASE_URL="http://127.0.0.1:8080/v1" && open-webui serve && kill $PID ;;
-        6) ./build/bin/llama-bench -m "$M_PATH" -t "$THRD" ;;
-        7) echo "1) 0.7B 2) 2B 3) 3B 4) BitVLA"; read -p "C: " D_C
-           [[ "$D_C" == "1" ]] && M_ID="microsoft/bitnet_b1_58-large"
-           [[ "$D_C" == "2" ]] && M_ID="microsoft/bitnet-b1.58-2B-4T"
-           [[ "$D_C" == "3" ]] && M_ID="microsoft/bitnet_b1_58-3B"
-           [[ "$D_C" == "4" ]] && M_ID="lxsy/bitvla-bf16"
-           python3 utils/download-model.py --model "$M_ID" --local-dir "models/${M_ID##*/}" ;;
-        8) git pull --recursive && configure_hardware ;;
-        9) exit 0 ;;
+    for plugin in $(list_plugins); do
+        parse_metadata "$plugin"
+        echo "$i) ⚙️  ${NAME:-$(basename "$plugin" .sh)}"
+        MAP[$i]="$plugin"; ((i++))
+    done
+
+    echo "$i) 📦 market list"; MAP[$i]="market_list"; ((i++))
+    echo "$i) 📥 install plugin"; MAP[$i]="install"; ((i++))
+    echo "$i) 🗑️ remove plugin"; MAP[$i]="remove"; ((i++))
+    echo "$i) ⚡ benchmark"; MAP[$i]="benchmark"; ((i++))
+    echo "$i) 🚪 exit"; MAP[$i]="exit"
+
+    read -p "Select: " CHOICE
+    ACTION=${MAP[$CHOICE]}
+
+    case $ACTION in
+        *.sh) run_plugin "$ACTION" ;;
+        market_list) market_list ;;
+        install) read -p "Plugin name: " P; market_install "$P" ;;
+        remove) read -p "Plugin name: " P; market_remove "$P" ;;
+        benchmark) run_benchmark ;;
+        exit) exit 0 ;;
+        *) echo "Invalid" ;;
     esac
+
 done
+
+# ================================================================
+# 📘 README (auto-generated reference)
+# ================================================================
+: <<'README'
+# BitNet Omni-Shield
+
+## Features
+- Plugin system with metadata (#@name, #@desc, #@deps)
+- Self-healing dependency manager
+- Real llama.cpp benchmarking
+- Live CPU/RAM/GPU monitor
+- Local plugin marketplace
+
+## Plugin Format
+#@name: Name
+#@desc: Description
+#@deps: python ffmpeg llama
+
+## Commands
+- Add plugin: place .sh in ./plugins/
+- Marketplace: ./marketplace/
+- Benchmark: menu option
+
+## Requirements
+- cmake, python3, llama.cpp build
+
+README
