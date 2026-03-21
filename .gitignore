@@ -1,0 +1,13 @@
+__pycache__/
+venv/
+build/
+chat_logs/
+models/*
+!models/.gitkeep
+system_debug.log
+BitNet/
+logs/
+marketplace
+plugins/
+system_debug.log
+.temp_*
