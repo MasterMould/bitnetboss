@@ -27,19 +27,17 @@ Simple local AI for Ubuntu 24.04
 16) 🚪 EXIT
 Select [1-16]:  
 -  
--  
 6) 🩺 DOCTOR    Auto-Repair & Audit  
-🩺 BitNet Doctor: Auditing System Health...
-ℹ️  Some fixes require sudo and a session restart to take effect.
-✅ Group 'video' OK
-✅ Group 'render' OK
-✅ Intel oneAPI found (active compute GPU)
-ℹ️  AMD GPU also detected but Intel Arc takes priority — ROCm not required
-✅ Python venv present
-✅ venv packages OK
-✅ llama-bench binary found
-✨ Audit complete.
--  
+🩺 BitNet Doctor: Auditing System Health...  
+ℹ️  Some fixes require sudo and a session restart to take effect.  
+✅ Group 'video' OK  
+✅ Group 'render' OK  
+✅ Intel oneAPI found (active compute GPU)  
+ℹ️  AMD GPU also detected but Intel Arc takes priority — ROCm not required  
+✅ Python venv present  
+✅ venv packages OK  
+✅ llama-bench binary found  
+✨ Audit complete.  
 -  
 #Download a model  
 7) 📥 DOWNLOAD  1.58-bit Models  
