@@ -78,10 +78,7 @@ run_doctor() {
         fi
     done
 
-    # 2. Check GPU drivers & toolkits
-    # Use the same priority order as configure_hardware (NVIDIA > Intel > AMD)
-    # so we only report a missing toolkit for the GPU that will actually be used
-    # for inference — not every GPU present (e.g. an AMD iGPU alongside Intel Arc).
+    # 2. Check GPU drivers & toolkits — auto-install what we can
     local GPU_LINES
     GPU_LINES=$(lspci | grep -iE "VGA|3D controller|Display controller")
 
@@ -89,22 +86,26 @@ run_doctor() {
         echo -e "${GREEN}✅ NVIDIA driver: $(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -n1)${NC}"
     elif echo "$GPU_LINES" | grep -iq "Intel"; then
         if [[ ! -d "/opt/intel/oneapi" ]]; then
-            echo -e "${RED}❌ Intel oneAPI missing. Use Reinstall to fix.${NC}"
+            echo -e "${CYAN}  → Intel oneAPI not found — attempting install...${NC}"
+            sudo apt install -y intel-oneapi-compiler-dpcpp-cpp intel-oneapi-mkl >>"$LOG_FILE" 2>&1 \
+                && echo -e "${GREEN}✅ Intel oneAPI installed${NC}" \
+                || echo -e "${YELLOW}⚠️  oneAPI install incomplete — run Reinstall for full setup${NC}"
         else
-            echo -e "${GREEN}✅ Intel oneAPI found (active compute GPU)${NC}"
+            echo -e "${GREEN}✅ Intel oneAPI found${NC}"
         fi
-        # Report any AMD GPU as present but not used for compute
-        if echo "$GPU_LINES" | grep -iqE "AMD|ATI|Radeon"; then
-            echo -e "${YELLOW}ℹ️  AMD GPU also detected but Intel Arc takes priority — ROCm not required${NC}"
-        fi
+        echo "$GPU_LINES" | grep -iqE "AMD|ATI|Radeon" && \
+            echo -e "${CYAN}ℹ️  AMD iGPU also present — Intel Arc takes priority${NC}"
     elif echo "$GPU_LINES" | grep -iqE "AMD|ATI|Radeon"; then
         if [[ ! -f "/opt/rocm/bin/rocminfo" ]]; then
-            echo -e "${RED}❌ AMD ROCm missing. Use Reinstall to fix.${NC}"
+            echo -e "${CYAN}  → AMD ROCm not found — attempting install...${NC}"
+            sudo apt install -y rocm-dev >>"$LOG_FILE" 2>&1 \
+                && echo -e "${GREEN}✅ ROCm installed${NC}" \
+                || echo -e "${YELLOW}⚠️  ROCm install failed — run Reinstall for manual ROCm setup${NC}"
         else
-            echo -e "${GREEN}✅ AMD ROCm found (active compute GPU)${NC}"
+            echo -e "${GREEN}✅ AMD ROCm found${NC}"
         fi
     else
-        echo -e "${YELLOW}⚠️  No discrete GPU detected — CPU-only mode${NC}"
+        echo -e "${CYAN}ℹ️  No discrete GPU — CPU-only mode${NC}"
     fi
 
     # 3. Python virtual environment + required packages
@@ -134,11 +135,15 @@ run_doctor() {
         fi
     fi
 
-    # 4. llama-bench binary check
+    # 4. llama-bench binary — auto-build if missing
     if [[ -f "$LLAMA_BIN" ]]; then
         echo -e "${GREEN}✅ llama-bench binary found${NC}"
     else
-        echo -e "${RED}❌ llama-bench not built. Use Reinstall to build.${NC}"
+        echo -e "${CYAN}  → llama-bench not found — building...${NC}"
+        configure_hardware
+        [[ -f "$LLAMA_BIN" ]] \
+            && echo -e "${GREEN}✅ llama-bench built${NC}" \
+            || echo -e "${YELLOW}⚠️  Build did not produce llama-bench — check Logs${NC}"
     fi
 
     echo -e "${GREEN}✨ Audit complete.${NC}"
@@ -435,9 +440,14 @@ _prepare_bitnet_kernels() {
     fi
 
     if [[ -z "$GEN_SCRIPT" ]]; then
-        echo -e "${RED}❌ Generator script not found in source tree or downloadable.${NC}"
-        echo -e "${RED}   Re-run Reinstall to re-clone BitNet source.${NC}"
-        return 1
+        echo -e "${YELLOW}  → Generator not found — using synthesiser${NC}"
+        _synthesise_lut_header "$HEADER" || return 1
+        # Apply patch then return — no generator to run
+        local PATCH_TARGET="$SCRIPT_DIR/src/ggml-bitnet-mad.cpp"
+        if [[ -f "$PATCH_TARGET" ]] && grep -q "int8_t \* y_col" "$PATCH_TARGET"; then
+            sed -i 's/int8_t \* y_col/const int8_t \* y_col/g' "$PATCH_TARGET"
+        fi
+        return 0
     fi
 
     echo -e "${CYAN}  → Running: $(basename "$GEN_SCRIPT")${NC}"
@@ -494,18 +504,21 @@ configure_hardware() {
     elif command -v gcc &>/dev/null; then
         CC="gcc";      CXX="g++"
     else
-        echo -e "${RED}❌ No supported compiler (need clang or gcc). Run Reinstall.${NC}"
-        return 1
+        echo -e "${CYAN}  → No compiler found — installing clang-18...${NC}"
+        sudo apt update -qq && sudo apt install -y clang-18 >>"$LOG_FILE" 2>&1 \
+            && CC="clang-18" CXX="clang++-18" \
+            || { echo -e "${RED}❌ Compiler install failed. Check $LOG_FILE${NC}"; return 1; }
     fi
     echo -e "${CYAN}  → Compiler: $CC / $CXX${NC}"
 
-    # BASE_FLAGS: compiler + explicit OpenMP library path for clang
-    # cmake's FindOpenMP can't locate libomp.so automatically with clang —
-    # find it and pass it directly.
+    # Auto-install libomp-dev if missing before searching
+    if ! find /usr/lib -name "libomp.so" 2>/dev/null | grep -q .; then
+        sudo apt install -y libomp-dev >>"$LOG_FILE" 2>&1
+    fi
+
     local OMP_LIB
-    OMP_LIB=$(find /usr/lib/llvm-18 /usr/lib/x86_64-linux-gnu \
+    OMP_LIB=$(find /usr/lib/llvm-18 /usr/lib/x86_64-linux-gnu /usr/lib \
         -name "libomp.so" 2>/dev/null | head -1)
-    [[ -z "$OMP_LIB" ]] && OMP_LIB=$(find /usr/lib -name "libomp.so" 2>/dev/null | head -1)
 
     local OPENMP_FLAGS=""
     if [[ -n "$OMP_LIB" ]]; then
@@ -515,8 +528,6 @@ configure_hardware() {
             -DOpenMP_C_LIB_NAMES=omp \
             -DOpenMP_CXX_LIB_NAMES=omp \
             -DOpenMP_omp_LIBRARY=${OMP_LIB}"
-    else
-        echo -e "${YELLOW}  → libomp.so not found — OpenMP disabled (install libomp-dev)${NC}"
     fi
 
     local BASE_FLAGS="-DCMAKE_C_COMPILER=$CC -DCMAKE_CXX_COMPILER=$CXX $OPENMP_FLAGS"
@@ -703,7 +714,10 @@ download_models() {
     elif command -v curl &>/dev/null; then
         curl -L --progress-bar -C - -o "$MODEL_FILE" "$MODEL_URL"
     else
-        echo -e "${RED}❌ Neither wget nor curl found. Install one and retry.${NC}"; return 1
+        echo -e "${CYAN}  → Installing wget...${NC}"
+        sudo apt install -y wget >>"$LOG_FILE" 2>&1 \
+            && wget -c --show-progress -O "$MODEL_FILE" "$MODEL_URL" \
+            || { echo -e "${RED}❌ Download unavailable — no wget or curl${NC}"; return 1; }
     fi
 
     echo -e "${GREEN}✅ Downloaded: $MODEL_FILE${NC}"
@@ -712,18 +726,38 @@ download_models() {
         echo -e "${GREEN}✅ Default model set to: $M_PATH${NC}"
 }
 
-# HuggingFace snapshot downloader — uses venv python + huggingface_hub
 _hf_snapshot_download() {
     local REPO_ID="$1" LOCAL_DIR="$2"
     echo -e "${CYAN}📦 Downloading $REPO_ID via HuggingFace Hub...${NC}"
 
+    # Ensure venv exists
     if [[ ! -x "$VENV_PY" ]]; then
-        echo -e "${YELLOW}  → venv not found — running Doctor to create it...${NC}"
-        run_doctor
+        python3 -m venv "$SCRIPT_DIR/venv" >>"$LOG_FILE" 2>&1
     fi
 
-    "$VENV_PY" -c "import huggingface_hub" &>/dev/null || \
-        "$VENV_PIP" install --quiet huggingface_hub hf_transfer
+    # Ensure huggingface_hub is installed — retry once on failure
+    "$VENV_PY" -c "import huggingface_hub" &>/dev/null || {
+        "$VENV_PIP" install --quiet huggingface_hub hf_transfer >>"$LOG_FILE" 2>&1 || \
+        "$VENV_PIP" install huggingface_hub >>"$LOG_FILE" 2>&1
+    }
+
+    # If still no huggingface_hub, fall back to wget/curl direct download
+    if ! "$VENV_PY" -c "import huggingface_hub" &>/dev/null; then
+        echo -e "${YELLOW}  → huggingface_hub unavailable — trying direct wget/curl...${NC}"
+        mkdir -p "$LOCAL_DIR"
+        local DIRECT_URL="https://huggingface.co/${REPO_ID}/resolve/main/ggml-model-i2_s.gguf"
+        local DEST_FILE="$LOCAL_DIR/ggml-model-i2_s.gguf"
+        if command -v wget &>/dev/null; then
+            wget -c --show-progress -O "$DEST_FILE" "$DIRECT_URL" && \
+                echo -e "${GREEN}✅ Downloaded: $DEST_FILE${NC}" || \
+                echo -e "${RED}❌ Direct download also failed${NC}"
+        elif command -v curl &>/dev/null; then
+            curl -L --progress-bar -C - -o "$DEST_FILE" "$DIRECT_URL" && \
+                echo -e "${GREEN}✅ Downloaded: $DEST_FILE${NC}" || \
+                echo -e "${RED}❌ Direct download also failed${NC}"
+        fi
+        return
+    fi
 
     mkdir -p "$LOCAL_DIR"
     HF_HUB_ENABLE_HF_TRANSFER=1 "$VENV_PY" - <<PYEOF
@@ -743,7 +777,6 @@ except Exception as e:
 PYEOF
     if [[ $? -eq 0 ]]; then
         echo -e "${GREEN}✅ Download complete: $LOCAL_DIR${NC}"
-        # Offer to set first .gguf found as default
         local FIRST_GGUF
         FIRST_GGUF=$(find "$LOCAL_DIR" -name "*.gguf" | head -1)
         if [[ -n "$FIRST_GGUF" ]]; then
@@ -752,7 +785,7 @@ PYEOF
                 echo -e "${GREEN}✅ Default model: $M_PATH${NC}"
         fi
     else
-        echo -e "${RED}❌ Download failed — check $LOG_FILE${NC}"
+        echo -e "${RED}❌ HuggingFace download failed — see $LOG_FILE${NC}"
     fi
 }
 
@@ -810,8 +843,11 @@ reinstall_all() {
 # ================================================================
 launch_webui() {
     if [[ ! -f "$LLAMA_SERVER" ]]; then
-        echo -e "${RED}❌ llama-server not found at $LLAMA_SERVER${NC}"
-        echo -e "${YELLOW}   Run Reinstall to build it first.${NC}"
+        echo -e "${CYAN}🔨 llama-server not found — building now...${NC}"
+        configure_hardware || return 1
+    fi
+    if [[ ! -f "$LLAMA_SERVER" ]]; then
+        echo -e "${RED}❌ Build completed but llama-server still not found at $LLAMA_SERVER${NC}"
         return 1
     fi
     echo -e "${CYAN}🌐 Starting llama-server on :8080...${NC}"
@@ -821,8 +857,10 @@ launch_webui() {
     if command -v open-webui &>/dev/null; then
         open-webui serve
     else
-        echo -e "${YELLOW}⚠️  open-webui not installed. Install with: pip install open-webui${NC}"
-        echo -e "${YELLOW}   llama-server is live — connect any OpenAI-compatible client to http://localhost:8080${NC}"
+        echo -e "${CYAN}  → open-webui not found — installing...${NC}"
+        "$VENV_PIP" install --quiet open-webui >>"$LOG_FILE" 2>&1 \
+            && open-webui serve \
+            || echo -e "${YELLOW}  → open-webui install failed — llama-server is live at http://localhost:8080${NC}"
     fi
 }
 
@@ -972,8 +1010,12 @@ market_remove() {
 # ⚡ BENCHMARK
 # ================================================================
 run_benchmark() {
-    require_tool "llama-bench" "[[ -f $LLAMA_BIN ]]" fix_llama_bench || return 1
-    require_tool "bc"          "command -v bc"        fix_bc          || return 1
+    # Auto-build if llama-bench is missing
+    if [[ ! -f "$LLAMA_BIN" ]]; then
+        echo -e "${CYAN}⚡ llama-bench not found — building...${NC}"
+        configure_hardware || return 1
+    fi
+    require_tool "bc" "command -v bc" fix_bc || return 1
 
     local BEST="CPU" SCORE=0
 
@@ -1019,24 +1061,42 @@ print_header() {
 # 🧪 DEFAULT PLUGINS (created on first run if plugins/ is empty)
 # ================================================================
 create_default_plugins() {
-# chat.sh — real llama-cli invocation with GPU detection
 cat > "$PLUGIN_DIR/chat.sh" << 'PLUGEOF'
 #@name: Chat
 #@desc: Terminal chat with llama-cli + auto-log
 #@deps: llama
 
-LLAMA_CLI="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build/bin/llama-cli"
-MODELS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/models"
-LOG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/chat_logs"
-BENCH_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.bitnet_benchmark"
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LLAMA_CLI="$SCRIPT_ROOT/build/bin/llama-cli"
+MODELS_DIR="$SCRIPT_ROOT/models"
+LOG_DIR="$SCRIPT_ROOT/chat_logs"
+BENCH_FILE="$SCRIPT_ROOT/.bitnet_benchmark"
 mkdir -p "$LOG_DIR"
 
-[[ ! -f "$LLAMA_CLI" ]] && { echo "❌ llama-cli not built. Run Reinstall."; exit 1; }
+# Auto-build if binary missing
+if [[ ! -f "$LLAMA_CLI" ]]; then
+    echo "🔨 Building llama-cli..."
+    bash "$SCRIPT_ROOT/$(basename "${BASH_SOURCE[1]}")" --build-only 2>/dev/null \
+        || (cd "$SCRIPT_ROOT" && source "$(basename "${BASH_SOURCE[1]}")" configure_hardware 2>/dev/null)
+    # Final check — use configure_hardware from parent if still missing
+    [[ ! -f "$LLAMA_CLI" ]] && { echo "❌ Build failed — run Reinstall from the main menu"; exit 1; }
+fi
 
-MODEL=$(find "$MODELS_DIR" -maxdepth 2 -name "*.gguf" | head -1)
-[[ -z "$MODEL" ]] && { echo "❌ No model found. Run Download first."; exit 1; }
+# Auto-find or wait for model
+MODEL=$(find "$MODELS_DIR" -maxdepth 2 -name "*.gguf" 2>/dev/null | head -1)
+if [[ -z "$MODEL" ]]; then
+    echo "📥 No model found — downloading BitNet-b1.58-2B-4T..."
+    mkdir -p "$MODELS_DIR"
+    wget -c --show-progress \
+        -O "$MODELS_DIR/bitnet-b1.58-2B-4T.gguf" \
+        "https://huggingface.co/microsoft/BitNet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf" \
+    || curl -L --progress-bar \
+        -o "$MODELS_DIR/bitnet-b1.58-2B-4T.gguf" \
+        "https://huggingface.co/microsoft/BitNet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf"
+    MODEL=$(find "$MODELS_DIR" -maxdepth 2 -name "*.gguf" 2>/dev/null | head -1)
+    [[ -z "$MODEL" ]] && { echo "❌ Download failed — check internet connection"; exit 1; }
+fi
 
-# Use GPU layers if a GPU backend was benchmarked
 NGL=0
 [[ -f "$BENCH_FILE" ]] && source "$BENCH_FILE"
 [[ "${backend:-CPU}" != "CPU" ]] && NGL=99
@@ -1048,42 +1108,60 @@ echo "Type /bye to exit. Logging to $LOG_DIR/history.log"
     | tee -a "$LOG_DIR/history.log"
 PLUGEOF
 
-# file-chat.sh — document Q&A via stdin pipe to llama-cli
 cat > "$PLUGIN_DIR/file-chat.sh" << 'PLUGEOF'
 #@name: File-Chat
 #@desc: Analyze documents — PDF, XLSX, CSV, TXT
 #@deps: llama python
 
-LLAMA_CLI="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/build/bin/llama-cli"
-MODELS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/models"
-VENV_PY="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/venv/bin/python3"
+SCRIPT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LLAMA_CLI="$SCRIPT_ROOT/build/bin/llama-cli"
+MODELS_DIR="$SCRIPT_ROOT/models"
+VENV_PY="$SCRIPT_ROOT/venv/bin/python3"
+VENV_PIP="$SCRIPT_ROOT/venv/bin/pip"
 
-[[ ! -f "$LLAMA_CLI" ]] && { echo "❌ llama-cli not built. Run Reinstall."; exit 1; }
-MODEL=$(find "$MODELS_DIR" -maxdepth 2 -name "*.gguf" | head -1)
-[[ -z "$MODEL" ]] && { echo "❌ No model found. Run Download first."; exit 1; }
+# Auto-build if binary missing
+if [[ ! -f "$LLAMA_CLI" ]]; then
+    echo "🔨 Building llama-cli..."
+    configure_hardware 2>/dev/null || true
+    [[ ! -f "$LLAMA_CLI" ]] && { echo "❌ Build failed — run Reinstall from main menu"; exit 1; }
+fi
+
+# Auto-download if no model
+MODEL=$(find "$MODELS_DIR" -maxdepth 2 -name "*.gguf" 2>/dev/null | head -1)
+if [[ -z "$MODEL" ]]; then
+    echo "📥 Downloading model..."
+    mkdir -p "$MODELS_DIR"
+    wget -qO "$MODELS_DIR/bitnet-b1.58-2B-4T.gguf" \
+        "https://huggingface.co/microsoft/BitNet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf" \
+    || curl -sSL -o "$MODELS_DIR/bitnet-b1.58-2B-4T.gguf" \
+        "https://huggingface.co/microsoft/BitNet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf" \
+    || true
+    MODEL=$(find "$MODELS_DIR" -maxdepth 2 -name "*.gguf" 2>/dev/null | head -1)
+    [[ -z "$MODEL" ]] && { echo "❌ Download failed — check internet connection"; exit 1; }
+fi
 
 read -rp "📄 File path: " FPATH
 [[ ! -f "$FPATH" ]] && { echo "❌ File not found: $FPATH"; exit 1; }
 
-# Extract text — use python for PDF/XLSX, cat for plain text
 EXT="${FPATH##*.}"
 case "${EXT,,}" in
-    pdf)  "$VENV_PY" -c "
-import sys
+    pdf)
+        "$VENV_PY" -c "import pdfplumber" &>/dev/null || \
+            "$VENV_PIP" install --quiet pdfplumber >/dev/null 2>&1
+        "$VENV_PY" -c "
+import pdfplumber, sys
 try:
-    import pdfplumber
     with pdfplumber.open('$FPATH') as p:
         print('\n'.join(pg.extract_text() or '' for pg in p.pages))
-except ImportError:
-    print('[pdfplumber not installed — pip install pdfplumber]')" ;;
+except Exception as e:
+    print(f'PDF error: {e}', file=sys.stderr)" ;;
     csv|txt|md) cat "$FPATH" ;;
-    *)    strings "$FPATH" ;;
+    *) strings "$FPATH" ;;
 esac | head -c 8000 | "$LLAMA_CLI" -m "$MODEL" \
     -p "Analyze the following document and answer questions about it:\n\n" \
     -cnv --color -t "$(nproc)" 2>/dev/null
 PLUGEOF
 
-# vision.sh — llava/BitVLA image analysis with mmproj auto-download
 cat > "$PLUGIN_DIR/vision.sh" << 'PLUGEOF'
 #@name: Vision
 #@desc: Image analysis via LLaVA / BitVLA (auto-downloads mmproj)
@@ -1094,15 +1172,35 @@ LLAMA_CLI="$SCRIPT_ROOT/build/bin/llama-cli"
 MODELS_DIR="$SCRIPT_ROOT/models"
 MMPROJ="$MODELS_DIR/mmproj-model-f16.gguf"
 
-[[ ! -f "$LLAMA_CLI" ]] && { echo "❌ llama-cli not built. Run Reinstall."; exit 1; }
-MODEL=$(find "$MODELS_DIR" -maxdepth 2 -name "*.gguf" ! -name "mmproj*" | head -1)
-[[ -z "$MODEL" ]] && { echo "❌ No model found. Run Download first."; exit 1; }
+# Auto-build if binary missing
+if [[ ! -f "$LLAMA_CLI" ]]; then
+    echo "🔨 Building llama-cli..."
+    configure_hardware 2>/dev/null || true
+    [[ ! -f "$LLAMA_CLI" ]] && { echo "❌ Build failed — run Reinstall from main menu"; exit 1; }
+fi
 
-if [[ ! -f "$MMPROJ" ]]; then
-    echo "📥 Downloading BakLLaVA mmproj..."
-    wget -qO "$MMPROJ" \
-        "https://huggingface.co/mys/ggml_bakllava-1/resolve/main/mmproj-model-f16.gguf" \
-    || { echo "❌ mmproj download failed"; exit 1; }
+# Auto-download model if missing
+MODEL=$(find "$MODELS_DIR" -maxdepth 2 -name "*.gguf" ! -name "mmproj*" 2>/dev/null | head -1)
+if [[ -z "$MODEL" ]]; then
+    echo "📥 Downloading model..."
+    mkdir -p "$MODELS_DIR"
+    wget -qO "$MODELS_DIR/bitnet-b1.58-2B-4T.gguf" \
+        "https://huggingface.co/microsoft/BitNet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf" \
+    || curl -sSL -o "$MODELS_DIR/bitnet-b1.58-2B-4T.gguf" \
+        "https://huggingface.co/microsoft/BitNet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf" \
+    || true
+    MODEL=$(find "$MODELS_DIR" -maxdepth 2 -name "*.gguf" ! -name "mmproj*" 2>/dev/null | head -1)
+    [[ -z "$MODEL" ]] && { echo "❌ Download failed — check internet connection"; exit 1; }
+fi
+
+# Auto-download mmproj — try wget then curl
+if [[ ! -s "$MMPROJ" ]]; then
+    echo "📥 Downloading mmproj..."
+    MMPROJ_URL="https://huggingface.co/mys/ggml_bakllava-1/resolve/main/mmproj-model-f16.gguf"
+    wget -qO "$MMPROJ" "$MMPROJ_URL" 2>/dev/null || rm -f "$MMPROJ"
+    [[ ! -s "$MMPROJ" ]] && \
+        curl -sSL -o "$MMPROJ" "$MMPROJ_URL" 2>/dev/null || rm -f "$MMPROJ"
+    [[ ! -s "$MMPROJ" ]] && { echo "❌ mmproj download failed — check internet"; exit 1; }
 fi
 
 read -rp "👁️  Image path: " IMG
@@ -1113,7 +1211,6 @@ read -rp "👁️  Image path: " IMG
     -t "$(nproc)" --color 2>/dev/null
 PLUGEOF
 
-# voice.sh — Whisper STT → LLM → response
 cat > "$PLUGIN_DIR/voice.sh" << 'PLUGEOF'
 #@name: Voice
 #@desc: Whisper speech-to-text → LLM pipeline
@@ -1125,28 +1222,43 @@ MODELS_DIR="$SCRIPT_ROOT/models"
 VENV_PY="$SCRIPT_ROOT/venv/bin/python3"
 VENV_PIP="$SCRIPT_ROOT/venv/bin/pip"
 
-[[ ! -f "$LLAMA_CLI" ]] && { echo "❌ llama-cli not built. Run Reinstall."; exit 1; }
-MODEL=$(find "$MODELS_DIR" -maxdepth 2 -name "*.gguf" ! -name "mmproj*" | head -1)
-[[ -z "$MODEL" ]] && { echo "❌ No model found. Run Download first."; exit 1; }
+# Auto-build if binary missing
+if [[ ! -f "$LLAMA_CLI" ]]; then
+    echo "🔨 Building llama-cli..."
+    configure_hardware 2>/dev/null || true
+    [[ ! -f "$LLAMA_CLI" ]] && { echo "❌ Build failed — run Reinstall from main menu"; exit 1; }
+fi
 
-# Install whisper if missing
+# Auto-download model if missing
+MODEL=$(find "$MODELS_DIR" -maxdepth 2 -name "*.gguf" ! -name "mmproj*" 2>/dev/null | head -1)
+if [[ -z "$MODEL" ]]; then
+    echo "📥 Downloading model..."
+    mkdir -p "$MODELS_DIR"
+    wget -qO "$MODELS_DIR/bitnet-b1.58-2B-4T.gguf" \
+        "https://huggingface.co/microsoft/BitNet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf" \
+    || curl -sSL -o "$MODELS_DIR/bitnet-b1.58-2B-4T.gguf" \
+        "https://huggingface.co/microsoft/BitNet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf" \
+    || true
+    MODEL=$(find "$MODELS_DIR" -maxdepth 2 -name "*.gguf" ! -name "mmproj*" 2>/dev/null | head -1)
+    [[ -z "$MODEL" ]] && { echo "❌ Download failed — check internet connection"; exit 1; }
+fi
+
+# Auto-install whisper + sounddevice if missing
 "$VENV_PY" -c "import whisper" &>/dev/null || \
-    "$VENV_PIP" install --quiet openai-whisper sounddevice
+    "$VENV_PIP" install --quiet openai-whisper sounddevice scipy >/dev/null 2>&1
 
-echo "🎙️  Recording 5 seconds... (press Ctrl+C to stop early)"
+echo "🎙️  Recording 5 seconds..."
 TMPWAV=$(mktemp --suffix=.wav)
 "$VENV_PY" - <<PYEOF
-import sounddevice as sd, scipy.io.wavfile as wav, numpy as np
+import sounddevice as sd, scipy.io.wavfile as wav
 fs=16000; dur=5
-print("Recording...")
 audio=sd.rec(int(dur*fs),samplerate=fs,channels=1,dtype='int16')
 sd.wait()
 wav.write("$TMPWAV", fs, audio)
-print("Done.")
 PYEOF
 
 TRANSCRIPT=$("$VENV_PY" - <<PYEOF
-import whisper, sys
+import whisper
 m=whisper.load_model("base")
 r=m.transcribe("$TMPWAV")
 print(r["text"].strip())
